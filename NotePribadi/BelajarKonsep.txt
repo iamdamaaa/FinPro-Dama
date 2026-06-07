@@ -1,0 +1,36 @@
+1. Snapshot — Fitur Kritis yang Belum Ada di Spesifikasi Awal
+Dokumen ini memperkenalkan konsep Snapshot yang sebenarnya sangat penting tapi tidak pernah kamu sebut secara eksplisit.
+Apa itu Snapshot dalam konteks ini?
+Bayangkan skenario ini:
+
+Pelanggan pesan "Cuci Sepatu Putih" dengan harga Rp 25.000
+Seminggu kemudian admin mengedit harga service itu menjadi Rp 30.000
+Pesanan lama harus tetap tercatat Rp 25.000 — bukan ikut berubah
+
+Snapshot adalah teknik menyalin dan mengunci data pada saat transaksi terjadi, bukan mengambil data live dari tabel master.
+Yang di-snapshot dalam sistem ini:
+DataDisimpan diKenapaservice_nameorder_itemsKalau service dihapus/diganti nama, riwayat tetap terbacaprice per itemorder_itemsKalau harga berubah, pesanan lama tidak ikut berubahcustomer_nameordersKalau user ganti nama, riwayat nama pemesan di nota tetap aslicity_name, district_name, village_nameuser_addressesKalau admin hapus wilayah, alamat user tidak error
+Ini sudah sesuai dengan spesifikasi kamu di bab 11.1 (edit nama tidak merusak riwayat) dan bab 4.2 (hapus wilayah tidak merusak alamat). Tapi sekarang kamu tahu mekanisme teknisnya.
+
+ANALISIS PARSIAL — Per Bagian Dokumen
+Bagian 2: Migrations & Models
+Yang perlu diperhatikan:
+orders menyimpan customer_name sebagai snapshot — pastikan ini diisi saat order dibuat, bukan diambil live dari tabel users. Ini penting karena user bisa ganti nama.
+otps punya kolom window_start — ini untuk tracking kapan hitungan 1 jam dimulai. Logikanya:
+Pertama kirim OTP → catat window_start = sekarang, resend_count = 0
+Resend → cek: (sekarang - window_start) < 1 jam?
+  → Ya: resend_count + 1, maksimal 3
+  → Tidak: reset window_start dan resend_count
+2. Pendalaman QR
+Catatan penting soal PDF QR Code:
+Dokumen menyebut QR di-encode sebagai Base64 lalu disematkan langsung ke DOMPDF. Ini pendekatan yang benar untuk thermal PDF — tidak perlu menyimpan file QR terpisah di storage, QR langsung embedded ke dalam PDF saat di-generate.
+Alur generate invoice:
+Request download invoice
+        ↓
+Generate QR Code → konversi ke Base64 image
+        ↓
+Render template HTML (blade) dengan data order + QR
+        ↓
+DOMPDF konversi HTML → PDF 80mm
+        ↓
+Stream ke browser / simpan sementara untuk email

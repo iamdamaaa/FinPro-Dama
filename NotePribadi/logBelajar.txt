@@ -1,0 +1,6 @@
+5/6/2026
+1. postman
+-kesalahan-
+ternyata postman harus mendapatkan permission untuk acses private
+-perbaikan-
+sudah direstart dan berhasil, harus di izinkan untuk aksess

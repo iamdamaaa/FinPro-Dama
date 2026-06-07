@@ -1,0 +1,439 @@
+SPESIFIKASI LENGKAP APLIKASI ANJEM LAUNDRY
+> **Versi Dokumen:** 1.0 Final
+> **Status:** Siap Eksekusi
+> **Tujuan:** Referensi tunggal untuk developer, anak buah, dan AI coding agent
+---
+DAFTAR ISI
+No	           |    Bab
+1	           | Gambaran Umum Sistem
+2	           | Arsitektur & Stack Teknologi
+3	           | Autentikasi & Manajemen Akun
+4	           | Manajemen Wilayah (Admin)
+5	           | Manajemen Kategori (Admin)
+6	           | Manajemen Service & Harga (Admin)
+7	           | Manajemen Pesanan — Sisi Admin
+8	           | Manajemen User (Admin)
+9	           | Halaman Utama — Sisi User
+10	           | Alur Pemesanan — Sisi User
+11	           | Profil & Alamat — Sisi User
+12	           | Riwayat Pesanan — Sisi User
+13	           | Alur Status Pesanan & Notifikasi
+14	           | Output Nota & Invoice
+15	           | Notifikasi Email & WhatsApp
+16	           | Log Admin
+17	           | Badge / Bell Notifikasi Admin
+18	           | Asumsi Teknis yang Disepakati
+---
+1. GAMBARAN UMUM SISTEM
+Field	|  Detail
+Nama Aplikasi	|  Anjem Laundry
+Jenis	|  Aplikasi web manajemen laundry berbasis pickup & delivery
+Model Bisnis	|  Pelanggan pesan via web → admin handle semua proses operasional (tidak ada kurir atau staff terpisah di sistem)
+Dua Role:
+Admin — mengelola seluruh operasional: pesanan, kategori, service, wilayah, user
+User (Pelanggan) — melihat layanan, membuat pesanan, memantau status, mengelola profil
+---
+2. ARSITEKTUR & STACK TEKNOLOGI
+Struktur Folder Repository
+```
+anjem-laundry/          ← root monorepo
+├── frontend/           ← React + Vite (deploy ke Vercel)
+└── backend/            ← Laravel (deploy ke VPS)
+```
+Stack Teknologi
+Layer	| Teknologi
+Frontend	| React, Vite, Tailwind CSS
+Backend	| PHP Laravel
+Auth	| Laravel Sanctum — mode API Token (bukan cookie/session)
+Database	| MySQL
+OTP	| Fonnte (WhatsApp API)
+Notifikasi WA	| Fonnte
+Notifikasi Email	| SMTP (konfigurasi di `.env`)
+PDF Nota	| Library PDF di backend (generate server-side)
+QR Code	| Generate di backend, disematkan di nota PDF
+Deployment Frontend	| Vercel (CI/CD via GitHub)
+Deployment Backend	| VPS
+Catatan Sanctum API Token
+Frontend (Vercel) dan backend (VPS) berada di domain berbeda → wajib pakai token-based, bukan cookie-based
+Setiap request dari frontend menyertakan header: `Authorization: Bearer {token}`
+Token diberikan saat login berhasil
+---
+3. AUTENTIKASI & MANAJEMEN AKUN
+3.1 Role Admin — Login
+Kredensial: nomor telepon + OTP
+Admin pertama dibuat via database seeder
+Admin berikutnya bisa ditambahkan oleh admin yang sudah ada melalui dashboard
+3.2 Role User — Register
+Field yang diisi saat register:
+Nama lengkap
+Nomor telepon (digunakan sebagai kredensial utama)
+Alur register:
+User mengisi nama + nomor telepon
+Sistem mengirim OTP via WhatsApp menggunakan Fonnte
+User memasukkan kode OTP
+Jika OTP valid → akun terbuat, user langsung login
+3.3 Role User — Login
+Alur login:
+User memasukkan nomor telepon
+Sistem mengirim OTP via WhatsApp menggunakan Fonnte
+User memasukkan kode OTP
+Jika OTP valid → user mendapat token Sanctum, masuk ke aplikasi
+3.4 Aturan OTP
+Aturan	|  Detail
+Media pengiriman	|  WhatsApp via Fonnte (tidak ada SMS)
+Batas resend	|  Maksimal 3 kali dalam rentang waktu 1 jam
+Perilaku OTP lama	|  Otomatis dihapus/tidak valid ketika OTP baru dikirim
+OTP aktif	|  Hanya OTP paling baru yang berlaku
+Jika sudah 3x resend	| User tidak bisa minta OTP lagi selama sisa waktu 1 jam berlangsung
+Fallback	|  Tidak ada (tidak ada email OTP, tidak ada SMS)
+---
+4. MANAJEMEN WILAYAH (ADMIN)
+4.1 Konsep
+Wilayah bersifat hierarkis: Kota → Kecamatan → Kelurahan
+Seluruh data wilayah dikelola oleh admin dari dashboard.
+User hanya bisa memilih dari pilihan yang sudah ada (tidak bisa input bebas untuk bagian kota/kecamatan/kelurahan).
+4.2 Kemampuan Admin
+Tambah kota baru
+Tambah kecamatan di bawah kota tertentu
+Tambah kelurahan di bawah kecamatan tertentu
+Edit nama kota / kecamatan / kelurahan
+Hapus wilayah
+> **Catatan hapus wilayah:** Jika kelurahan/kecamatan/kota dihapus namun sudah dipakai di alamat user yang tersimpan, alamat tersebut tetap tersimpan dengan data wilayah lama (tidak rusak/error). Tampilkan data lama apa adanya.
+4.3 Cara User Memilih Alamat
+Saat user membuat atau menyimpan alamat:
+Pilih Kota (dropdown dari data admin)
+Pilih Kecamatan (dropdown, hanya tampil kecamatan milik kota yang dipilih)
+Pilih Kelurahan (dropdown, hanya tampil kelurahan milik kecamatan yang dipilih)
+Isi Detail Alamat bebas: nama jalan, nomor rumah, patokan, RT/RW, dll.
+---
+5. MANAJEMEN KATEGORI (ADMIN)
+Fungsi: Mengelompokkan service. Contoh: "Sepatu", "Helm", "Pakaian".
+Kemampuan admin:
+Tambah kategori baru (minimal: nama kategori)
+Edit nama kategori
+Hapus kategori
+> **Catatan hapus kategori:** Perlu diperhatikan bahwa service yang berada di bawah kategori yang dihapus harus ditangani (misal: service ikut terhapus atau diberi status non-aktif). Keputusan ini diserahkan ke implementasi developer, namun harus ada konfirmasi di UI sebelum hapus.
+---
+6. MANAJEMEN SERVICE & HARGA (ADMIN)
+6.1 Konsep Service
+Setiap service terhubung ke satu kategori.
+Contoh relasi:
+`"Sepatu Putih"` → Kategori: Sepatu
+`"Sepatu Warna"` → Kategori: Sepatu
+`"Cuci Helm Standar"` → Kategori: Helm
+6.2 Durasi Layanan
+Durasi yang tersedia tetap/mutlak, tidak bisa dikustomisasi:
+Pilihan
+1 Hari
+2 Hari
+3 Hari
+6.3 Harga per Durasi
+Saat admin menambah atau mengedit service, admin mengisi harga untuk masing-masing durasi secara terpisah:
+Durasi	|  Harga
+1 Hari	| [diisi admin / boleh dikosongkan]
+2 Hari	| [diisi admin / boleh dikosongkan]
+3 Hari	| [diisi admin / boleh dikosongkan]
+> **Aturan kosong:** Jika admin mengosongkan harga untuk durasi tertentu → durasi tersebut **resmi tidak tersedia** untuk service itu.
+6.4 Kemampuan Admin
+Tambah service baru (nama, pilih kategori, isi harga per durasi)
+Edit service (nama, kategori, harga per durasi)
+Hapus service
+6.5 Perilaku di Sisi User
+Ketika user memilih filter durasi di halaman utama:
+Service yang tersedia di durasi tersebut → tampil normal, bisa ditambahkan ke keranjang
+Service yang tidak tersedia di durasi tersebut → tampil dengan efek transparan/disabled. Jika diklik, muncul pesan: `"Durasi layanan ini tidak tersedia"`
+User wajib memilih durasi terlebih dahulu sebelum bisa menambahkan service ke keranjang.
+---
+7. MANAJEMEN PESANAN — SISI ADMIN
+7.1 Tabel Daftar Pesanan
+Dashboard admin menampilkan tabel pesanan dengan kolom:
+Kolom	|  Keterangan
+ID Order	|  Kode unik pesanan, bisa diklik untuk masuk ke detail
+QR Pesanan	|  Gambar QR yang berisi link ke halaman detail pesanan
+Nama Pemesan	|  Nama user yang memesan
+Tanggal Pick Up	|  Tanggal yang dipilih user
+Tanggal Delivery	|  Otomatis = Tanggal Pick Up + Durasi
+Alamat	|  Ditampilkan singkat: nama kecamatan saja
+Aksi	| Tombol cetak/download nota
+Klik ID Order → masuk ke halaman detail pesanan dari order tersebut.
+7.2 Detail Pesanan (Admin)
+Admin dapat melihat seluruh informasi pesanan secara lengkap dan melakukan berbagai aksi tanpa konfirmasi dari user:
+Yang bisa diedit admin:
+Tambah item/service baru ke pesanan (bebas dari service manapun, tidak terikat aturan durasi)
+Hapus item dari pesanan
+Edit item (nama, harga, quantity)
+Edit alamat pengiriman
+Edit tanggal pick up (tanggal delivery otomatis menyesuaikan)
+Ubah status pesanan (mengikuti alur status)
+Ubah status pembayaran (sudah bayar / belum bayar)
+> **Penting:** Semua perubahan oleh admin tidak memicu notifikasi ke user, **kecuali** perubahan status (lihat bagian 13).
+7.3 Scan QR untuk Cari Pesanan
+Admin bisa membuka fitur scan QR di dashboard
+Menggunakan kamera HP (browser-based camera/scanner)
+QR berisi link URL ke halaman detail pesanan
+QR yang ada di dashboard sama persis dengan QR yang tercetak di nota
+Setelah scan → langsung diarahkan ke halaman detail pesanan tersebut
+7.4 Status Pembayaran
+Status pembayaran bersifat manual, tanpa payment gateway:
+Status	|  Keterangan
+Belum Bayar	|  Default saat pesanan dibuat
+Sudah Bayar	|  Diubah manual oleh admin
+Admin yang mengubah status pembayaran dari halaman detail pesanan.
+---
+8. MANAJEMEN USER (ADMIN)
+Yang bisa dilihat admin:
+Kolom	|  Keterangan
+ID	|  ID user di sistem
+Nomor Telepon	| Nomor yang digunakan sebagai kredensial
+Yang bisa dilakukan admin:
+Melihat daftar semua user (role: user/pelanggan)
+Menambahkan akun admin baru (dari dashboard)
+Catatan admin baru:
+Semua admin setara, tidak ada hierarki atau super admin
+Admin baru ditambahkan dengan mengisi: nama, nomor telepon, password
+Admin OTP melalui WA untuk login (tidak ada password)
+---
+9. HALAMAN UTAMA — SISI USER
+9.1 Sapaan Nama
+Halaman utama menampilkan sapaan personal menggunakan nama user yang login.
+Contoh: `"Halo, Budi! 👋"`
+9.2 Filter Durasi
+Di bagian atas (atau area prominan), tersedia tombol filter durasi:
+Pilihan
+1 Hari
+2 Hari
+3 Hari
+User wajib memilih salah satu durasi sebelum bisa menambahkan service ke keranjang.
+Filter durasi ini menentukan service mana yang aktif/tersedia dan yang disabled.
+9.3 Tampilan Kategori & Service
+Ditampilkan berdasarkan kategori
+Setiap kategori menampilkan service-service di dalamnya
+Service yang tersedia di durasi terpilih → tampil normal
+Service yang tidak tersedia di durasi terpilih → tampil transparan/disabled + tooltip `"Durasi layanan ini tidak tersedia"` saat diklik
+---
+10. ALUR PEMESANAN — SISI USER
+Step 1: Pilih Service & Keranjang
+Keranjang bersifat session (hilang ketika halaman di-refresh atau browser ditutup). Ini disengaja karena pelanggan sering belum tahu detail kuantitas saat mulai memilih.
+Aturan keranjang:
+Aturan	|   Detail
+Durasi	| Satu pesanan = satu durasi (durasi tidak bisa berbeda dalam satu keranjang)
+Multi-service	| Satu keranjang bisa berisi banyak service berbeda. Contoh: Sepatu Putih + Sepatu Warna dalam satu pesanan
+Quantity	| Setiap item di keranjang memiliki quantity (bisa lebih dari 1). Contoh: 3 pasang Sepatu Putih + 2 pasang Sepatu Warna, dengan durasi 3 hari
+Edit qty	| Quantity bisa diubah langsung dari keranjang
+Step 2: Pilih Alamat & Catatan
+User memilih salah satu alamat tersimpan di akunnya (atau alamat utama dipilih otomatis)
+User bisa langsung menambah alamat baru jika belum ada
+User mengisi catatan/note untuk pesanan (opsional). Contoh: `"Tolong hati-hati, ada noda di bagian sol"`
+User memilih tanggal pick up (input date, tidak ada slot jam)
+Tanggal delivery dihitung otomatis: Tanggal Pick Up + Durasi yang dipilih
+Step 3: Estimasi Biaya & Konfirmasi
+Sistem menampilkan ringkasan pesanan:
+Daftar item + quantity + harga satuan
+Durasi pengerjaan
+Tanggal pick up & estimasi tanggal delivery
+Total estimasi biaya (ditampilkan dengan label `"Estimasi"`)
+Alamat tujuan
+Catatan pesanan
+Tombol Konfirmasi Pesanan
+Setelah dikonfirmasi → pesanan masuk ke sistem, status awal: `"Pesanan Diterima"`
+> **Catatan "Estimasi":** Harga pada tahap ini adalah estimasi karena admin akan memvalidasi pesanan secara fisik sebelum menetapkan harga final. Harga final ditetapkan saat admin mengubah status ke "Proses".
+---
+11. PROFIL & ALAMAT — SISI USER
+11.1 Edit Profil
+User bisa mengubah nama
+Riwayat pesanan yang sudah ada tidak terpengaruh oleh perubahan nama (data historis tetap menyimpan nama saat pesanan dibuat)
+Nomor telepon tidak bisa diubah (karena merupakan kredensial login)
+11.2 Manajemen Alamat
+User bisa menyimpan banyak alamat
+Satu alamat bisa dijadikan Alamat Utama
+Saat membuat pesanan, Alamat Utama dipilih secara default
+Operasi alamat: tambah, edit, hapus, set sebagai utama
+Format alamat yang disimpan:
+Field   | Keterangan
+Kota    | Pilihan dari data admin
+Kecamatan | Pilihan dari data admin, hierarkis dari kota
+Kelurahan | Pilihan dari data admin, hierarkis dari kecamatan
+Detail alamat | Input bebas: nama jalan, nomor, patokan, RT/RW, dll.
+---
+12. RIWAYAT PESANAN — SISI USER
+12.1 Pesanan yang Ditampilkan
+Riwayat hanya menampilkan pesanan dengan status:
+✅ Selesai
+❌ Dibatalkan
+Pesanan yang masih aktif (dalam proses) tidak muncul di riwayat — muncul di halaman tracking/aktif pesanan.
+12.2 Kolom Riwayat
+Kolom   | Keterangan
+Order ID | Kode unik pesanan
+Tanggal Pick Up | Tanggal yang dijadwalkan
+Total Pembayaran | Selalu ditampilkan. Sebelum status "Proses": tampil angka estimasi dengan label "Estimasi". Setelah status "Proses": tampil angka final dengan label "Total"
+Status Pembayaran | Manual: Sudah Bayar / Belum Bayar
+12.3 Detail dari Riwayat
+User bisa mengklik pesanan di riwayat untuk melihat detail lengkap pesanan tersebut (read-only).
+---
+13. ALUR STATUS PESANAN & NOTIFIKASI
+13.1 Urutan Status
+```
+Pesanan Diterima
+      ↓
+Pick Up Berhasil
+      ↓
+Proses
+      ↓
+Menunggu Delivery
+      ↓
+Selesai
+
+(dari Pesanan Diterima saja) → Dibatalkan
+```
+> **Yang berhak mengubah status:** Hanya admin. User tidak bisa mengubah status kecuali melakukan **cancel** (lihat poin 13.7).
+---
+13.2 Status: PESANAN DITERIMA
+Dipicu oleh: User mengkonfirmasi pesanan
+Yang terjadi:
+Pesanan masuk ke sistem dengan status `"Pesanan Diterima"`
+Notifikasi email ke kantor (alamat email tetap di `.env`): pemberitahuan ada pesanan baru masuk, berisi ringkasan pesanan
+Notifikasi email ke user: konfirmasi pemesanan berhasil, berisi detail pesanan dan estimasi harga
+Badge/bell di dashboard admin bertambah (indikator pesanan baru)
+---
+13.3 Status: PICK UP BERHASIL
+Dipicu oleh: Admin mengubah status menjadi `"Pick Up Berhasil"`
+Yang terjadi:
+Status pesanan berubah
+Notifikasi email ke user: pemberitahuan bahwa pesanan telah di-pick up
+---
+13.4 Status: PROSES
+Dipicu oleh: Admin mengubah status menjadi `"Proses"`
+Pra-kondisi yang lazim: Sebelum mengubah ke "Proses", admin biasanya sudah mengedit detail pesanan (tambah/hapus/edit item, sesuaikan harga) berdasarkan kondisi fisik barang yang sudah di-pick up.
+Yang terjadi:
+Status pesanan berubah
+Harga pada pesanan menjadi final (bukan estimasi lagi)
+Notifikasi email ke user: rincian biaya final + link invoice (PDF yang bisa didownload)
+Notifikasi WhatsApp ke nomor telepon user via Fonnte: pemberitahuan pesanan sedang diproses + rincian biaya
+---
+13.5 Status: MENUNGGU DELIVERY
+Dipicu oleh: Admin mengubah status menjadi `"Menunggu Delivery"`
+Yang terjadi:
+Status pesanan berubah
+Notifikasi email ke user: pemberitahuan bahwa pesanan siap diantar
+---
+13.6 Status: SELESAI
+Dipicu oleh: Admin mengubah status menjadi `"Selesai"`
+Yang terjadi:
+Status pesanan berubah, pesanan masuk ke riwayat user
+Notifikasi email ke user: konfirmasi pesanan selesai
+Notifikasi WhatsApp ke nomor telepon user via Fonnte: konfirmasi pesanan selesai
+---
+13.7 Status: DIBATALKAN
+Dipicu oleh:
+User melakukan cancel (hanya bisa dilakukan saat status masih `"Pesanan Diterima"`)
+Admin bisa mengubah ke status dibatalkan kapan saja
+Saat user cancel:
+Muncul dialog konfirmasi: `"Yakin ingin membatalkan pesanan ini?"`
+User wajib mengisi alasan pembatalan (field teks, wajib diisi)
+Setelah dikonfirmasi → status berubah ke `"Dibatalkan"`
+Yang terjadi:
+Status pesanan berubah, pesanan masuk ke riwayat user
+Notifikasi email ke user: pemberitahuan pesanan dibatalkan
+---
+14. OUTPUT NOTA & INVOICE
+14.1 Konsep
+Nota dan invoice adalah satu dokumen yang sama — tidak ada dua dokumen terpisah.
+Dokumen ini dibuat dalam format PDF, ukuran thermal 80mm.
+14.2 Kapan Invoice Tersedia
+Siapa	| Kapan	| Cara Akses
+Admin	| Kapan saja	| Tombol download di baris tabel pesanan
+User	| Setelah status → `"Proses"`	| Link yang dikirim via email
+14.3 Isi Dokumen Nota/Invoice
+Field	|   Keterangan
+QR Code	| Berisi link URL ke halaman detail pesanan. QR ini sama dengan QR di dashboard admin
+Nama Pemesan	| Nama user saat pesanan dibuat
+Alamat	| Alamat lengkap (kota, kecamatan, kelurahan, detail)
+Tanggal Pick Up	| Tanggal yang dijadwalkan
+Durasi Layanan	| Contoh: `"1 Hari"` / `"2 Hari"` / `"3 Hari"`
+Detail Pesanan	Daftar item: nama service, quantity, harga satuan, subtotal
+Total Harga	Total keseluruhan
+Catatan	Catatan yang diisi user saat pesan
+14.4 Format & Download
+Property    | Detail
+Format      | PDF
+Ukuran kertas | Thermal 80mm (lebar tetap 80mm, tinggi menyesuaikan konten)
+Download    | Tombol download di dashboard admin & link di email user
+Cetak       | Bisa dicetak langsung dari browser
+---
+15. NOTIFIKASI EMAIL & WHATSAPP
+15.1 Ringkasan Notifikasi per Status
+Status	| Email ke User	| Email ke Kantor	| WA ke User
+Pesanan Diterima	| ✅ (detail pesanan + estimasi harga)	| ✅ (ada pesanan baru)	| ❌
+Pick Up Berhasil	| ✅ (pesanan sudah di-pick up)	| ❌	| ❌
+Proses	| ✅ (rincian biaya final + link invoice)	| ❌	| ✅
+Menunggu Delivery	| ✅ (pesanan siap diantar)	| ❌	| ❌
+Selesai	| ✅ (pesanan selesai)	| ❌	| ✅
+Dibatalkan	| ✅ (pesanan dibatalkan)	| ❌	| ❌
+15.2 Konfigurasi
+Komponen	Konfigurasi
+Email kantor	Satu alamat email tetap, disimpan di file `.env` backend. Tidak bisa diubah dari dashboard.
+WhatsApp	Menggunakan Fonnte API. API key disimpan di `.env` backend.
+SMTP Email	Konfigurasi di `.env` backend (host, port, username, password, encryption).
+15.3 Aturan Penting Notifikasi
+Admin mengedit detail pesanan (item, harga, alamat, tanggal) → tidak ada notifikasi ke user
+Notifikasi hanya dipicu oleh perubahan status
+Notifikasi WA hanya dua status: `"Proses"` dan `"Selesai"`
+---
+16. LOG ADMIN
+16.1 Apa yang Dicatat
+Log hanya mencatat perubahan status pesanan oleh admin.
+Setiap entri log berisi:
+Field   | Keterangan
+ID Pesanan | Referensi ke pesanan terkait
+Status sebelumnya | Status lama sebelum diubah
+Status sesudahnya | Status baru setelah diubah
+Waktu perubahan | Timestamp saat perubahan terjadi
+Admin | ID / nama admin yang melakukan perubahan
+16.2 Sifat Log
+Log bersifat internal — hanya bisa dilihat oleh admin
+User tidak bisa melihat log
+Log tidak mencatat perubahan detail pesanan (edit item, harga, alamat, tanggal) — hanya perubahan status
+---
+17. BADGE / BELL NOTIFIKASI ADMIN
+Dashboard admin memiliki ikon bell/badge
+Badge menampilkan jumlah pesanan baru yang masuk (status `"Pesanan Diterima"`) yang belum ditangani
+Badge berkurang/reset ketika admin membuka/memproses pesanan tersebut
+Implementasi: polling (interval) dari frontend ke endpoint backend yang mengembalikan jumlah pesanan baru
+---
+18. ASUMSI TEKNIS YANG DISEPAKATI
+Berikut adalah asumsi yang sudah dikonfirmasi oleh pemilik proyek dan menjadi bagian dari spesifikasi:
+No	Asumsi  |   Status
+1	Item di keranjang memiliki field quantity (bisa > 1)	✅ Dikonfirmasi
+2	Sebelum status "Proses", total di riwayat ditampilkan sebagai "Estimasi"; setelah "Proses" menjadi "Total" (final)	✅ Dikonfirmasi
+3	Admin tidak terikat aturan durasi saat menambah item ke pesanan — bisa tambah item service apapun	✅ Dikonfirmasi
+4	Sanctum menggunakan mode API Token (bukan cookie) karena frontend dan backend beda domain	✅ Dikonfirmasi
+5	Keranjang bersifat session (hilang saat refresh) — disengaja	✅ Dikonfirmasi
+6	Tanggal pick up ditentukan oleh user, tanggal delivery otomatis = pick up + durasi	✅ Dikonfirmasi
+7	Nota dan invoice adalah satu dokumen PDF yang sama	✅ Dikonfirmasi
+8	Alasan cancel wajib diisi oleh user, disimpan di field `cancellation_reason` di tabel orders	✅ Dikonfirmasi
+9	Durasi hanya 3 pilihan: 1 hari, 2 hari, 3 hari (tidak ada lagi opsi jam)	✅ Dikonfirmasi
+10	QR berisi link URL ke halaman detail pesanan, di-scan via kamera HP browser	✅ Dikonfirmasi
+---
+> *Dokumen ini adalah versi final yang siap dijadikan acuan pengembangan. Setiap perubahan kebutuhan setelah dokumen ini disepakati harus dicatat sebagai revisi dengan versi baru.*
+
+19. Library QR Code & PDF Driver Queue
+Analoginya dulu
+Kamu butuh dua alat untuk membuat nota:
+
+Satu alat untuk gambar QR Code
+Satu alat untuk cetak PDF nya
+
+Dua library yang disarankan itu adalah alat-alat tersebut, khusus untuk Laravel.
+Detail masing-masing
+simplesoftwareio/simple-qrcode
+Tugasnya: mengubah sebuah URL (link halaman detail pesanan) menjadi gambar QR Code. Nanti QR ini ditempel ke dalam nota PDF.
+barryvdh/laravel-dompdf
+Tugasnya: mengubah halaman HTML (template nota yang kamu desain) menjadi file PDF ukuran thermal 80mm yang bisa didownload.
+
+Driver Queue yang disarankan: database
+Artinya antrian tugasnya disimpan di tabel MySQL biasa — tidak perlu install software tambahan seperti Redis. Cocok untuk skala aplikasi laundry seperti ini. Simpel, cukup, tidak over-engineering.
+
+QR dikirim dari Backend melalui Base64, react tinggal tampilkan
+
+20. react halaman login dan register
+halaman ini dibuat terpisah agar maintenace mudah

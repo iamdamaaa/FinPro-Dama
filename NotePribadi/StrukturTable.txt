@@ -1,0 +1,536 @@
+SET FOREIGN_KEY_CHECKS = 0;
+SET SQL_MODE = 'STRICT_TRANS_TABLES,NO_ZERO_IN_DATE,NO_ZERO_DATE,
+               ERROR_FOR_DIVISION_BY_ZERO,NO_ENGINE_SUBSTITUTION';
+
+-- ============================================================
+-- KONVENSI NOTE DI FILE INI
+-- [PK]          = Primary Key
+-- [FK → x.y]   = Foreign Key ke tabel x kolom y
+-- [SNAPSHOT]    = Nilai disalin saat INSERT, tidak pernah di-UPDATE
+-- [SOFT DELETE] = Hapus via deleted_at, bukan DELETE FROM
+-- PENTING:      = Kalau diabaikan → bug di production
+-- Validasi:     = Wajib ada di level aplikasi (Laravel), bukan hanya DB
+-- ============================================================
+
+
+-- ------------------------------------------------------------
+-- 1. users
+-- Tujuan: Satu tabel untuk semua akun — customer & admin.
+--         Dibedakan via kolom `role`.
+--         Tidak ada tabel terpisah untuk admin.
+-- ------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS `users` (
+    -- [PK] Integer internal. JANGAN ekspos langsung ke URL publik.
+    `id`         BIGINT UNSIGNED  NOT NULL AUTO_INCREMENT,
+
+    `name`       VARCHAR(255)     NOT NULL,
+
+    -- Digunakan sebagai kredensial login untuk SEMUA role.
+    -- Customer: login via OTP ke nomor ini.
+    -- Admin: login via password, nomor ini tetap sebagai identifier.
+    -- UNIQUE — satu nomor hanya bisa punya satu akun.
+    `phone`      VARCHAR(20)      NOT NULL UNIQUE,
+
+    -- 'customer' = pelanggan, login via OTP.
+    -- 'admin'    = staf operasional, login via password.
+    -- Tidak ada super admin — semua admin setara.
+    `role`       ENUM('customer','admin') NOT NULL DEFAULT 'customer',
+
+    -- Hanya dipakai oleh admin. Untuk customer, kolom ini diisi
+    -- string kosong atau nilai placeholder — password tidak
+    -- pernah dipakai untuk autentikasi customer.
+    -- Validasi: Saat register customer, set password = '' atau
+    -- random hash (tidak dipakai). Jangan NULL agar schema konsisten.
+    `password`   VARCHAR(255)     NOT NULL DEFAULT '',
+
+    `created_at` TIMESTAMP        NOT NULL DEFAULT CURRENT_TIMESTAMP,
+
+    PRIMARY KEY (`id`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+
+-- ------------------------------------------------------------
+-- 2. personal_access_tokens
+-- Tujuan: Token Sanctum untuk autentikasi API.
+--         Frontend (Vercel) dan backend (VPS) beda domain →
+--         wajib token-based, bukan cookie/session.
+--         Setiap login sukses → buat token baru di tabel ini.
+--         Logout → hapus token dari tabel ini.
+-- ------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS `personal_access_tokens` (
+    `id`           BIGINT UNSIGNED  NOT NULL AUTO_INCREMENT,
+
+    -- [FK → users.id] Pemilik token.
+    -- ON DELETE CASCADE: user dihapus → tokennya otomatis terhapus.
+    `tokenable_id` BIGINT UNSIGNED  NOT NULL,
+
+    -- Label token. Contoh: 'mobile', 'web', 'admin-dashboard'.
+    -- Berguna untuk debugging — tahu dari device mana token dibuat.
+    `name`         VARCHAR(255)     NOT NULL,
+
+    -- Hash SHA-256 dari token asli. Token asli HANYA dikirim
+    -- sekali saat login, tidak disimpan di DB. Yang disimpan
+    -- hanya hash-nya.
+    `token`        VARCHAR(64)      NOT NULL UNIQUE,
+
+    -- Kapan terakhir token ini dipakai untuk request.
+    -- NULL = belum pernah dipakai sejak dibuat.
+    -- Berguna untuk invalidasi token idle (jika diperlukan di masa depan).
+    `last_used_at` TIMESTAMP        NULL DEFAULT NULL,
+
+    `created_at`   TIMESTAMP        NOT NULL DEFAULT CURRENT_TIMESTAMP,
+
+    PRIMARY KEY (`id`),
+    CONSTRAINT `fk_pat_user`
+        FOREIGN KEY (`tokenable_id`) REFERENCES `users` (`id`)
+        ON DELETE CASCADE ON UPDATE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+
+-- ------------------------------------------------------------
+-- 3. otps
+-- Tujuan: Menyimpan OTP sementara untuk verifikasi nomor telepon.
+--         Dipakai untuk: register customer & login customer.
+--         Admin tidak pakai OTP sama sekali.
+--
+-- PENTING — Aturan OTP (dari spesifikasi):
+--   • Hanya OTP paling baru yang valid per nomor telepon.
+--   • Saat OTP baru dikirim → OTP lama otomatis tidak valid
+--     (hapus record lama atau set expires_at ke masa lalu).
+--   • Maksimal 3x resend dalam 1 jam.
+--   • Setelah 3x resend → tolak permintaan selama sisa 1 jam.
+--   • Tidak ada fallback (tidak ada SMS, tidak ada email OTP).
+-- ------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS `otps` (
+    `id`           BIGINT UNSIGNED  NOT NULL AUTO_INCREMENT,
+
+    -- Nomor telepon target. Tidak ada FK ke users karena OTP
+    -- juga dipakai SEBELUM user terdaftar (saat register).
+    `phone`        VARCHAR(20)      NOT NULL,
+
+    -- Kode OTP yang dikirim via WhatsApp (Fonnte).
+    -- Simpan sebagai plain text atau hash — terserah implementasi,
+    -- tapi kalau plain text, pastikan expires_at pendek (5-10 menit).
+    `code`         VARCHAR(10)      NOT NULL,
+
+    -- Jumlah kali OTP sudah di-resend untuk nomor ini dalam
+    -- window 1 jam terakhir.
+    -- Validasi: Jika resend_count >= 3 DAN window belum expired
+    -- → tolak permintaan resend, return error ke frontend.
+    `resend_count` INT UNSIGNED     NOT NULL DEFAULT 0,
+
+    -- Kapan OTP ini kadaluwarsa. Set ke NOW() + 10 menit saat dibuat.
+    -- Validasi: Saat user submit OTP, cek expires_at > NOW().
+    `expires_at`   TIMESTAMP        NOT NULL,
+
+    -- Kapan window 1 jam untuk tracking resend_count dimulai.
+    -- Logika: jika NOW() > window_start + 1 jam → reset resend_count ke 0.
+    `window_start` TIMESTAMP        NOT NULL DEFAULT CURRENT_TIMESTAMP,
+
+    `created_at`   TIMESTAMP        NOT NULL DEFAULT CURRENT_TIMESTAMP,
+
+    PRIMARY KEY (`id`),
+    -- Index phone untuk pencarian cepat saat validasi OTP.
+    INDEX `idx_otps_phone` (`phone`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+
+-- ------------------------------------------------------------
+-- 4. cities
+-- Tujuan: Data kota — level 1 hierarki wilayah.
+--         Dikelola hanya oleh admin dari dashboard.
+--         User hanya bisa MEMILIH, tidak bisa input bebas.
+--
+-- [SOFT DELETE] Admin tidak bisa hard-delete kota yang sudah
+--   dipakai di alamat user. Gunakan deleted_at untuk
+--   menyembunyikan dari dropdown tanpa merusak data historis.
+-- ------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS `cities` (
+    `id`         BIGINT UNSIGNED  NOT NULL AUTO_INCREMENT,
+    `name`       VARCHAR(255)     NOT NULL,
+
+    -- NULL = aktif, tampil di dropdown user.
+    -- Terisi timestamp = soft deleted, disembunyikan dari dropdown.
+    -- Hard DELETE tetap diblokir jika ada FK dari districts.
+    `deleted_at` TIMESTAMP        NULL DEFAULT NULL,
+
+    PRIMARY KEY (`id`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+
+-- ------------------------------------------------------------
+-- 5. districts
+-- Tujuan: Data kecamatan — level 2, anak dari cities.
+--         Dropdown kecamatan hanya muncul setelah kota dipilih.
+-- [SOFT DELETE] Sama seperti cities.
+-- ------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS `districts` (
+    `id`         BIGINT UNSIGNED  NOT NULL AUTO_INCREMENT,
+
+    -- [FK → cities.id]
+    -- ON DELETE RESTRICT: kota tidak bisa dihapus (hard delete)
+    -- selama masih punya kecamatan. Gunakan soft delete di cities.
+    `city_id`    BIGINT UNSIGNED  NOT NULL,
+
+    `name`       VARCHAR(255)     NOT NULL,
+    `deleted_at` TIMESTAMP        NULL DEFAULT NULL,
+
+    PRIMARY KEY (`id`),
+    CONSTRAINT `fk_districts_city`
+        FOREIGN KEY (`city_id`) REFERENCES `cities` (`id`)
+        ON DELETE RESTRICT ON UPDATE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+
+-- ------------------------------------------------------------
+-- 6. villages
+-- Tujuan: Data kelurahan/desa — level 3, anak dari districts.
+-- [SOFT DELETE] Sama seperti cities dan districts.
+-- ------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS `villages` (
+    `id`          BIGINT UNSIGNED  NOT NULL AUTO_INCREMENT,
+
+    -- [FK → districts.id]
+    `district_id` BIGINT UNSIGNED  NOT NULL,
+
+    `name`        VARCHAR(255)     NOT NULL,
+    `deleted_at`  TIMESTAMP        NULL DEFAULT NULL,
+
+    PRIMARY KEY (`id`),
+    CONSTRAINT `fk_villages_district`
+        FOREIGN KEY (`district_id`) REFERENCES `districts` (`id`)
+        ON DELETE RESTRICT ON UPDATE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+
+-- ------------------------------------------------------------
+-- 7. user_addresses
+-- Tujuan: Alamat pengiriman yang disimpan oleh user.
+--         Satu user bisa punya banyak alamat.
+--         Satu alamat bisa dijadikan "Alamat Utama" (is_primary=1).
+--
+-- PENTING — Snapshot nama wilayah:
+--   Kolom city_name, district_name, village_name adalah SNAPSHOT
+--   dari nama wilayah saat alamat disimpan.
+--   Tujuan: Jika admin mengedit atau soft-delete wilayah,
+--   alamat user tetap terbaca dengan nama yang benar.
+--   Jangan pernah JOIN ke cities/districts/villages untuk
+--   menampilkan nama wilayah di alamat historis — pakai snapshot.
+--
+-- PENTING — is_primary:
+--   Hanya boleh ada SATU alamat dengan is_primary=1 per user.
+--   Enforce di level aplikasi (Laravel): saat set alamat X
+--   sebagai utama → UPDATE SET is_primary=0 WHERE user_id=X DULU,
+--   baru SET is_primary=1 untuk alamat yang dipilih.
+-- ------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS `user_addresses` (
+    `id`            BIGINT UNSIGNED  NOT NULL AUTO_INCREMENT,
+
+    -- [FK → users.id]
+    -- ON DELETE CASCADE: user dihapus → alamatnya ikut terhapus.
+    `user_id`       BIGINT UNSIGNED  NOT NULL,
+
+    -- [FK → villages.id] Referensi ke kelurahan yang dipilih.
+    -- ON DELETE RESTRICT: village tidak bisa hard-deleted selama
+    -- masih ada alamat yang mereferensikannya.
+    -- Gunakan soft delete di villages.
+    `village_id`    BIGINT UNSIGNED  NOT NULL,
+
+    -- [SNAPSHOT] Nama wilayah saat alamat disimpan.
+    -- Di-set saat INSERT, TIDAK di-update meski nama wilayah berubah.
+    -- Ini adalah sumber kebenaran untuk display alamat historis.
+    `city_name`     VARCHAR(255)     NOT NULL,
+    `district_name` VARCHAR(255)     NOT NULL,
+    `village_name`  VARCHAR(255)     NOT NULL,
+
+    -- Input bebas user: nama jalan, nomor rumah, RT/RW, patokan, dll.
+    `detail`        VARCHAR(500)     NOT NULL,
+
+    -- 1 = alamat utama (dipilih default saat checkout).
+    -- 0 = alamat biasa.
+    -- Validasi: maksimal satu is_primary=1 per user_id.
+    `is_primary`    TINYINT(1)       NOT NULL DEFAULT 0,
+
+    `created_at`    TIMESTAMP        NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    `updated_at`    TIMESTAMP        NOT NULL DEFAULT CURRENT_TIMESTAMP
+                    ON UPDATE CURRENT_TIMESTAMP,
+
+    PRIMARY KEY (`id`),
+    CONSTRAINT `fk_ua_user`
+        FOREIGN KEY (`user_id`) REFERENCES `users` (`id`)
+        ON DELETE CASCADE ON UPDATE CASCADE,
+    CONSTRAINT `fk_ua_village`
+        FOREIGN KEY (`village_id`) REFERENCES `villages` (`id`)
+        ON DELETE RESTRICT ON UPDATE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+
+-- ------------------------------------------------------------
+-- 8. categories
+-- Tujuan: Mengelompokkan service. Contoh: Sepatu, Helm, Pakaian.
+--         Dikelola hanya oleh admin.
+--
+-- [SOFT DELETE] Jika kategori dihapus, service di bawahnya
+--   tidak ikut terhapus secara fisik — ikut soft-deleted juga.
+--   Logika di Laravel: saat soft-delete category →
+--   UPDATE services SET deleted_at=NOW() WHERE category_id=X.
+-- ------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS `categories` (
+    `id`         BIGINT UNSIGNED  NOT NULL AUTO_INCREMENT,
+    `name`       VARCHAR(255)     NOT NULL,
+    `deleted_at` TIMESTAMP        NULL DEFAULT NULL,
+    PRIMARY KEY (`id`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+
+-- ------------------------------------------------------------
+-- 9. services
+-- Tujuan: Layanan laundry yang bisa dipesan oleh user.
+--         Setiap service punya harga berbeda per durasi.
+--
+-- Aturan harga:
+--   NULL  = durasi tersebut tidak tersedia untuk service ini.
+--   Angka = tersedia dengan harga tersebut.
+--   JANGAN gunakan 0.00 untuk "tidak tersedia" — ambigu dengan "gratis".
+--
+-- [SOFT DELETE] Service yang pernah dipakai di order tidak bisa
+--   hard-deleted karena ada FK RESTRICT dari order_items.
+--   Gunakan deleted_at. Service yang soft-deleted tidak muncul
+--   di halaman user, tapi tetap readable dari order_items lama.
+-- ------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS `services` (
+    `id`          BIGINT UNSIGNED  NOT NULL AUTO_INCREMENT,
+
+    -- [FK → categories.id]
+    -- ON DELETE RESTRICT: kategori tidak bisa hard-deleted selama
+    -- masih ada service aktif. Gunakan soft delete di categories.
+    `category_id` BIGINT UNSIGNED  NOT NULL,
+
+    `name`        VARCHAR(255)     NOT NULL,
+
+    -- NULL = tidak tersedia untuk durasi ini.
+    -- Tampilkan service sebagai disabled di frontend jika NULL.
+    `price_1day`  DECIMAL(12,2)    NULL DEFAULT NULL,
+    `price_2day`  DECIMAL(12,2)    NULL DEFAULT NULL,
+    `price_3day`  DECIMAL(12,2)    NULL DEFAULT NULL,
+
+    `deleted_at`  TIMESTAMP        NULL DEFAULT NULL,
+    `created_at`  TIMESTAMP        NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    `updated_at`  TIMESTAMP        NOT NULL DEFAULT CURRENT_TIMESTAMP
+                  ON UPDATE CURRENT_TIMESTAMP,
+
+    PRIMARY KEY (`id`),
+    CONSTRAINT `fk_services_category`
+        FOREIGN KEY (`category_id`) REFERENCES `categories` (`id`)
+        ON DELETE RESTRICT ON UPDATE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+
+-- ------------------------------------------------------------
+-- 10. orders
+-- Tujuan: Satu baris = satu transaksi pesanan laundry.
+--
+-- Alur status (urutan wajib diikuti):
+--   pending → picked_up → processing → ready → delivered
+--   pending → cancelled  (satu-satunya cabang)
+--   Admin bisa skip ke cancelled dari status manapun.
+--   User hanya bisa cancel dari status 'pending'.
+--
+-- PENTING — total_price:
+--   Sebelum status 'processing': nilai ini adalah ESTIMASI.
+--   Setelah status 'processing': nilai ini adalah FINAL.
+--   Frontend wajib baca status untuk menentukan label yang ditampilkan:
+--   status < processing → tampilkan "Estimasi Rp X"
+--   status >= processing → tampilkan "Total Rp X"
+--
+-- PENTING — customer_name:
+--   [SNAPSHOT] Nama user saat order dibuat.
+--   TIDAK di-update meski user ganti nama profil.
+--   Ini sumber kebenaran untuk display nama di nota/invoice.
+-- ------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS `orders` (
+    `id`                  BIGINT UNSIGNED  NOT NULL AUTO_INCREMENT,
+
+    -- [FK → users.id]
+    -- ON DELETE RESTRICT: order tidak boleh hilang jika user dihapus.
+    `user_id`             BIGINT UNSIGNED  NOT NULL,
+
+    -- [FK → user_addresses.id]
+    -- ON DELETE RESTRICT: alamat tidak bisa dihapus jika masih
+    -- dipakai oleh order yang aktif.
+    `address_id`          BIGINT UNSIGNED  NOT NULL,
+
+    -- [SNAPSHOT] Nama user saat order dibuat.
+    -- Tidak berubah meski user edit profil.
+    `customer_name`       VARCHAR(255)     NOT NULL,
+
+    -- Kode unik yang ditampilkan ke user dan dicetak di nota.
+    -- Format rekomendasi: ORD-YYYYMMDD-XXXX (XXXX = 4 char random).
+    -- Ini yang dipakai di URL publik, BUKAN kolom id.
+    -- Contoh: /orders/ORD-20240601-X7K2
+    `order_code`          VARCHAR(50)      NOT NULL UNIQUE,
+
+    -- Nilai valid: 1, 2, atau 3.
+    -- Menentukan kolom harga mana yang diambil dari services:
+    --   1 → price_1day, 2 → price_2day, 3 → price_3day.
+    -- Delivery date = pickup_date + duration_days.
+    -- Validasi: WAJIB ada CHECK constraint atau validasi di Laravel.
+    `duration_days`       TINYINT UNSIGNED NOT NULL,
+
+    `pickup_date`         DATE             NOT NULL,
+
+    -- Dihitung otomatis: pickup_date + duration_days.
+    -- Di-set saat order dibuat, bukan NULL.
+    `delivery_date`       DATE             NOT NULL,
+
+    -- Lihat alur status di komentar header tabel di atas.
+    -- Setiap perubahan status WAJIB dicatat di order_status_logs.
+    -- Validasi: transisi status yang tidak sah harus ditolak di Laravel.
+    `status`              ENUM(
+                              'pending',      -- User baru konfirmasi, belum ditangani admin
+                              'picked_up',    -- Admin konfirmasi barang sudah diambil
+                              'processing',   -- Sedang dikerjakan. Harga jadi FINAL di sini
+                              'ready',        -- Selesai dikerjakan, siap diantar
+                              'delivered',    -- Sudah sampai ke user
+                              'cancelled'     -- Dibatalkan. cancellation_reason wajib terisi
+                          ) NOT NULL DEFAULT 'pending',
+
+    -- Dikelola manual oleh admin. Tidak ada payment gateway.
+    -- 'unpaid'   = default, belum dibayar.
+    -- 'paid'     = admin konfirmasi sudah dibayar.
+    -- 'refunded' = untuk kasus cancel setelah bayar (opsional di v1).
+    `payment_status`      ENUM('unpaid','paid','refunded')
+                          NOT NULL DEFAULT 'unpaid',
+
+    -- Catatan dari user saat pesan (opsional).
+    -- Contoh: "Tolong hati-hati, ada noda di bagian sol"
+    `note`                TEXT             NULL DEFAULT NULL,
+
+    -- Wajib terisi jika status = 'cancelled'.
+    -- Validasi di Laravel: jika status di-set ke cancelled dan
+    -- kolom ini NULL atau kosong → tolak dengan error.
+    `cancellation_reason` TEXT             NULL DEFAULT NULL,
+
+    -- Lihat penjelasan PENTING di header tabel.
+    -- Di-recalculate saat admin edit item di order.
+    `total_price`         DECIMAL(14,2)    NOT NULL DEFAULT 0.00,
+
+    `created_at`          TIMESTAMP        NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    `updated_at`          TIMESTAMP        NOT NULL DEFAULT CURRENT_TIMESTAMP
+                          ON UPDATE CURRENT_TIMESTAMP,
+
+    PRIMARY KEY (`id`),
+    CONSTRAINT `chk_duration_days`
+        CHECK (`duration_days` IN (1, 2, 3)),
+    CONSTRAINT `fk_orders_user`
+        FOREIGN KEY (`user_id`) REFERENCES `users` (`id`)
+        ON DELETE RESTRICT ON UPDATE CASCADE,
+    CONSTRAINT `fk_orders_address`
+        FOREIGN KEY (`address_id`) REFERENCES `user_addresses` (`id`)
+        ON DELETE RESTRICT ON UPDATE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+
+-- ------------------------------------------------------------
+-- 11. order_items
+-- Tujuan: Detail item dalam satu pesanan (many → orders).
+--         Satu order bisa punya banyak item berbeda.
+--         Quantity per item bisa > 1.
+--
+-- PENTING — Snapshot service:
+--   service_name dan price adalah SNAPSHOT saat order dibuat.
+--   Tidak berubah meski admin edit nama/harga service di kemudian hari.
+--   service_id tetap ada sebagai referensi, tapi display name dan
+--   harga selalu diambil dari kolom snapshot di tabel ini.
+--
+-- PENTING — Admin bisa tambah item custom:
+--   Admin bisa tambah item ke order yang sudah ada, dengan
+--   service apapun (tidak terikat durasi). Saat admin tambah item,
+--   set service_id ke service yang dipilih, snapshot nama & harga
+--   saat itu juga.
+-- ------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS `order_items` (
+    `id`           BIGINT UNSIGNED  NOT NULL AUTO_INCREMENT,
+
+    -- [FK → orders.id]
+    -- ON DELETE CASCADE: order dihapus → item-itemnya ikut terhapus.
+    `order_id`     BIGINT UNSIGNED  NOT NULL,
+
+    -- [FK → services.id]
+    -- ON DELETE RESTRICT: service yang pernah dipakai tidak bisa
+    -- hard-deleted. Gunakan soft delete di services.
+    `service_id`   BIGINT UNSIGNED  NOT NULL,
+
+    -- [SNAPSHOT] Nama service saat item ditambahkan ke order.
+    `service_name` VARCHAR(255)     NOT NULL,
+
+    -- Jumlah item. Contoh: 3 pasang sepatu = quantity 3.
+    -- Validasi: minimal 1, tidak boleh 0 atau negatif.
+    `quantity`     INT UNSIGNED     NOT NULL DEFAULT 1,
+
+    -- [SNAPSHOT] Harga satuan saat item ditambahkan ke order.
+    -- Untuk item yang ditambahkan admin, harga bisa di-set manual.
+    `price`        DECIMAL(12,2)    NOT NULL,
+
+    -- Dihitung: price × quantity.
+    -- Di-set saat INSERT dan UPDATE quantity/price.
+    -- Jangan biarkan tidak sinkron dengan price × quantity.
+    `subtotal`     DECIMAL(14,2)    NOT NULL,
+
+    `created_at`   TIMESTAMP        NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    `updated_at`   TIMESTAMP        NOT NULL DEFAULT CURRENT_TIMESTAMP
+                   ON UPDATE CURRENT_TIMESTAMP,
+
+    PRIMARY KEY (`id`),
+    CONSTRAINT `fk_oi_order`
+        FOREIGN KEY (`order_id`) REFERENCES `orders` (`id`)
+        ON DELETE CASCADE ON UPDATE CASCADE,
+    CONSTRAINT `fk_oi_service`
+        FOREIGN KEY (`service_id`) REFERENCES `services` (`id`)
+        ON DELETE RESTRICT ON UPDATE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+
+-- ------------------------------------------------------------
+-- 12. order_status_logs
+-- Tujuan: Audit trail perubahan status pesanan.
+--         Hanya mencatat perubahan STATUS — bukan edit item/harga.
+--         Hanya bisa dilihat oleh admin.
+--
+-- PENTING: Setiap kali status di tabel orders berubah,
+--   WAJIB ada INSERT ke tabel ini di transaksi yang sama.
+--   Gunakan database transaction di Laravel untuk memastikan
+--   keduanya berhasil atau keduanya rollback.
+-- ------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS `order_status_logs` (
+    `id`         BIGINT UNSIGNED  NOT NULL AUTO_INCREMENT,
+
+    -- [FK → orders.id]
+    -- ON DELETE CASCADE: log ikut terhapus jika order dihapus.
+    `order_id`   BIGINT UNSIGNED  NOT NULL,
+
+    -- [FK → users.id] Admin yang melakukan perubahan.
+    -- ON DELETE RESTRICT: admin tidak bisa dihapus jika masih
+    -- punya log perubahan status.
+    `admin_id`   BIGINT UNSIGNED  NOT NULL,
+
+    -- Nilai ENUM status sebelum perubahan. Simpan sebagai string
+    -- agar tetap readable meski ENUM di orders berubah di masa depan.
+    `old_status` VARCHAR(50)      NOT NULL,
+
+    -- Nilai ENUM status setelah perubahan.
+    `new_status` VARCHAR(50)      NOT NULL,
+
+    `created_at` TIMESTAMP        NOT NULL DEFAULT CURRENT_TIMESTAMP,
+
+    PRIMARY KEY (`id`),
+    CONSTRAINT `fk_osl_order`
+        FOREIGN KEY (`order_id`) REFERENCES `orders` (`id`)
+        ON DELETE CASCADE ON UPDATE CASCADE,
+    CONSTRAINT `fk_osl_admin`
+        FOREIGN KEY (`admin_id`) REFERENCES `users` (`id`)
+        ON DELETE RESTRICT ON UPDATE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+
+SET FOREIGN_KEY_CHECKS = 1;
